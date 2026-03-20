@@ -1,0 +1,15 @@
+# --- HYDRA CORE DEPENDENCIES ---
+pyzmq==25.1.2
+psutil==5.9.8
+python-dotenv==1.0.1
+
+# --- DATA & ORCHESTRATION ---
+numpy==1.26.4
+pandas==2.2.1
+
+# --- MISSION CONTROL HUD ---
+streamlit==1.32.2
+plotly==5.19.0
+
+# --- TERMINAL ENHANCEMENT ---
+rich==13.7.1
