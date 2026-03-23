@@ -16,304 +16,300 @@ import zmq
 from datetime import datetime
 from collections import deque
 
-# --- CONFIGURAZIONE CORE ---
-SECRET_KEY = b"HYDRA_OBSIDIAN_V16_ULTRA"
+# --- CONFIGURAZIONE ELITE ---
+SECRET_KEY = b"HYDRA_PROMETHEUS_V17_2026"
 TCP_PORT = 5555
-UDP_PORT = 5556 # Per il Beacon discovery
-MAX_LOGS = 60
+UDP_PORT = 5556 
+MAX_LOGS = 100
 
-# --- UTILS DI RETE MULTI-LAYER ---
-def get_all_interfaces():
-    """Mappa tutte le interfacce: LAN, Wi-Fi, USB Ethernet, Virtual Bridge."""
-    interfaces = []
+# --- HELPER DI RETE ---
+def get_local_info():
+    """Ritorna l'hostname e tutti gli IP disponibili."""
+    hostname = socket.gethostname()
+    ips = []
     for interface, addrs in psutil.net_if_addrs().items():
         for addr in addrs:
             if addr.family == socket.AF_INET and not addr.address.startswith("127."):
-                interfaces.append({
-                    "name": interface,
-                    "ip": addr.address,
-                    "type": "USB/NDIS" if "ndis" in interface.lower() or "ethernet" in interface.lower() else "WLAN/LAN"
-                })
-    return interfaces
+                ips.append({"int": interface, "ip": addr.address})
+    return hostname, ips
 
-# --- STILI CSS ---
-def apply_custom_styles():
+# --- STILI CSS OBSIDIAN V17 ---
+def apply_v17_styles():
+    st.set_page_config(page_title="HYDRA V17", layout="wide")
     st.markdown("""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;700;900&family=Fira+Code:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;800&display=swap');
+        
+        :root { --accent: #00ff88; --bg: #050505; }
+        
         html, body, [class*="css"] { 
-            background-color: #050505; 
-            color: #d1d1d1; 
+            background-color: var(--bg); 
+            color: #eee; 
             font-family: 'Inter', sans-serif;
         }
-        .metric-card {
-            background: rgba(255, 255, 255, 0.02);
-            border: 1px solid rgba(0, 255, 136, 0.1);
-            padding: 15px;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
-        }
-        .node-container {
-            background: linear-gradient(180deg, #111, #080808);
-            border: 1px solid #222;
+        
+        .stMetric { background: #111; border: 1px solid #222; border-radius: 15px; padding: 15px !important; }
+        
+        .master-card {
+            background: linear-gradient(180deg, #0f0f0f 0%, #050505 100%);
+            border: 1px solid #333;
             padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 15px;
-            transition: all 0.3s ease;
+            border-radius: 20px;
+            border-left: 5px solid var(--accent);
+            margin-bottom: 20px;
         }
-        .node-container:hover { border-color: #00ff88; box-shadow: 0 0 20px rgba(0, 255, 136, 0.1); }
-        .status-online { color: #00ff88; font-weight: bold; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;}
-        h1, h2, h3 { letter-spacing: -2px; font-weight: 900; }
-        code { font-family: 'Fira Code', monospace !important; color: #00ff88 !important; background: transparent !important; }
-        .stDataFrame { border-radius: 10px; overflow: hidden; border: 1px solid #222; }
+        
+        .target-box {
+            border: 1px solid #444;
+            padding: 10px;
+            border-radius: 10px;
+            margin-top: 5px;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .target-box:hover { border-color: var(--accent); background: rgba(0, 255, 136, 0.05); }
+        
+        .status-led {
+            height: 10px; width: 10px; background-color: var(--accent);
+            border-radius: 50%; display: inline-block;
+            box-shadow: 0 0 10px var(--accent);
+            margin-right: 10px;
+        }
+        
+        h1 { font-weight: 800; letter-spacing: -3px; font-size: 4rem; margin-bottom: 0; }
+        code { font-family: 'JetBrains Mono', monospace !important; color: var(--accent) !important; }
         </style>
     """, unsafe_allow_html=True)
 
-# --- CLASSE MASTER ---
-class ObsidianMaster:
+# --- ENGINE MASTER ---
+class PrometheusMaster:
     def __init__(self):
+        self.hostname, self.interfaces = get_local_info()
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.ROUTER)
-        # Binding universale su tutte le interfacce (LAN, USB, BT-PAN)
         self.socket.bind(f"tcp://0.0.0.0:{TCP_PORT}")
         self.nodes = {} 
-        self.event_stream = deque(maxlen=MAX_LOGS)
-        self.metrics = {"tasks_ok": 0, "bytes_recv": 0}
+        self.events = deque(maxlen=MAX_LOGS)
         self.lock = threading.Lock()
+        self.running = True
 
     def start(self):
-        threading.Thread(target=self._beacon_announcer, daemon=True).start()
-        threading.Thread(target=self._network_engine, daemon=True).start()
-        threading.Thread(target=self._cleanup, daemon=True).start()
+        threading.Thread(target=self._udp_beacon, daemon=True).start()
+        threading.Thread(target=self._zmq_listen, daemon=True).start()
+        threading.Thread(target=self._monitor, daemon=True).start()
 
-    def _beacon_announcer(self):
-        """Invia segnali di presenza su ogni sottorete disponibile."""
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        while True:
-            for interface in get_all_interfaces():
+    def _udp_beacon(self):
+        """Annuncia: ID|HOSTNAME|IP su tutte le interfacce."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while self.running:
+            for iface in self.interfaces:
                 try:
-                    # Annuncia l'IP del master per l'auto-discovery
-                    msg = f"HYDRA_MASTER_V16|{interface['ip']}".encode()
-                    udp_sock.sendto(msg, ('<broadcast>', UDP_PORT))
+                    payload = f"HYDRA_V17|{self.hostname}|{iface['ip']}".encode()
+                    sock.sendto(payload, ('<broadcast>', UDP_PORT))
                 except: pass
             time.sleep(2)
 
-    def _network_engine(self):
-        while True:
+    def _zmq_listen(self):
+        while self.running:
             if self.socket.poll(100):
                 try:
                     parts = self.socket.recv_multipart()
-                    addr, payload, sig = parts[0], parts[2], parts[3].decode()
+                    # ROUTER format: [ID_WORKER, EMPTY, PAYLOAD, SIG]
+                    identity, payload, sig = parts[0], parts[2], parts[3].decode()
+                    
                     if hmac.new(SECRET_KEY, payload, hashlib.sha256).hexdigest() == sig:
                         data = json.loads(payload.decode())
-                        self._process(addr, data)
-                except: pass
+                        self._handle(identity, data)
+                except Exception as e:
+                    self.events.appendleft({"t": "ERR", "m": str(e)})
 
-    def _process(self, addr, data):
+    def _handle(self, identity, data):
         nid = data['id']
         with self.lock:
-            if data['t'] == 'HB':
-                self.nodes[nid] = {
-                    'addr': addr, 
-                    'stats': data['s'], 
-                    'history': data['h'], 
-                    'type': data.get('net_type', 'UNKNOWN'),
-                    'last': time.time()
-                }
-            elif data['t'] == 'ACK':
-                self.metrics["tasks_ok"] += 1
-                self.event_stream.appendleft({
-                    'time': datetime.now().strftime("%H:%M:%S"), 
-                    'node': nid, 
-                    'job': data['jid'], 
-                    'status': 'SUCCESS', 
-                    'latency': f"{data['el']:.3f}s",
-                    'cpu_at_task': f"{data['s']['cpu']}%"
+            self.nodes[nid] = {
+                'id_zmq': identity,
+                'hostname': data.get('host', 'Unknown'),
+                'stats': data['s'],
+                'history': data['h'],
+                'last_seen': time.time(),
+                'ip': data.get('ip', '?.?.?.?')
+            }
+            if data['type'] == 'DATA':
+                self.events.appendleft({
+                    "Time": datetime.now().strftime("%H:%M:%S"),
+                    "Node": nid,
+                    "Action": "HEARTBEAT_SYNC",
+                    "CPU": f"{data['s']['cpu']}%"
                 })
 
-    def _cleanup(self):
-        while True:
+    def _monitor(self):
+        while self.running:
             now = time.time()
             with self.lock:
-                dead = [n for n, d in self.nodes.items() if now - d['last'] > 12]
-                for n in dead: del self.nodes[n]
-            time.sleep(5)
+                to_delete = [n for n, d in self.nodes.items() if now - d['last_seen'] > 10]
+                for n in to_delete: del self.nodes[n]
+            time.sleep(3)
 
-# --- CLASSE WORKER ---
-class ObsidianWorker:
-    def __init__(self, target_ip=None):
-        self.id = f"HYDRA-{socket.gethostname()}-{uuid.uuid4().hex[:4]}".upper()
-        self.master_ip = target_ip
+# --- ENGINE WORKER ---
+class PrometheusWorker:
+    def __init__(self, master_ip):
+        self.hostname = socket.gethostname()
+        self.id = f"H-{uuid.uuid4().hex[:4].upper()}"
+        self.master_ip = master_ip
         self.ctx = zmq.Context()
         self.sock = self.ctx.socket(zmq.DEALER)
         self.sock.setsockopt_string(zmq.IDENTITY, self.id)
-        self.history = deque([0]*30, maxlen=30)
-        self.local_events = deque(maxlen=MAX_LOGS)
-        self.metrics = {"tasks_done": 0, "cpu": 0, "ram": 0, "threads": 0}
-        self.connection_type = "SCANNING"
-
-    def auto_discover(self):
-        """Logica gerarchica: Cerca Master in Sottorete -> USB -> Bluetooth."""
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.bind(('', UDP_PORT))
-        udp_sock.settimeout(5.0)
-        try:
-            data, addr = udp_sock.recvfrom(1024)
-            msg = data.decode()
-            if "HYDRA_MASTER_V16" in msg:
-                self.master_ip = msg.split("|")[1]
-                self.connection_type = "AUTO_DISCOVERED"
-                return True
-        except: return False
-        finally: udp_sock.close()
+        self.history = deque([0]*40, maxlen=40)
+        self.stats = {"cpu": 0, "ram": 0, "tasks": 0}
+        self.connected = False
 
     def start(self):
-        if not self.master_ip:
-            if not self.auto_discover():
-                self.master_ip = "127.0.0.1" # Fallback
-        
         self.sock.connect(f"tcp://{self.master_ip}:{TCP_PORT}")
-        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        threading.Thread(target=self._task_loop, daemon=True).start()
+        self.connected = True
+        threading.Thread(target=self._worker_loop, daemon=True).start()
 
-    def _task_loop(self):
+    def _worker_loop(self):
         while True:
-            if self.sock.poll(1000):
-                parts = self.sock.recv_multipart()
-                payload, sig = parts[1], parts[2].decode()
-                if hmac.new(SECRET_KEY, payload, hashlib.sha256).hexdigest() == sig:
-                    req = json.loads(payload.decode())
-                    t0 = time.time()
-                    # Neural Work Simulation
-                    for _ in range(300000): hashlib.sha256(b"neural_core_hash").hexdigest()
-                    el = time.time() - t0
-                    self.metrics["tasks_done"] += 1
-                    
-                    self.local_events.appendleft({
-                        'time': datetime.now().strftime("%H:%M:%S"), 
-                        'job': req['jid'], 
-                        'status': 'COMPLETED', 
-                        'lat': f"{el:.4f}s"
-                    })
-                    
-                    ans = {
-                        't': 'ACK', 'id': self.id, 'jid': req['jid'], 'el': el,
-                        's': {'cpu': psutil.cpu_percent(), 'ram': psutil.virtual_memory().percent}
-                    }
-                    msg = json.dumps(ans).encode()
-                    sig_ans = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
-                    self.sock.send_multipart([b"", msg, sig_ans.encode()])
-
-    def _heartbeat_loop(self):
-        while True:
-            self.metrics.update({
-                "cpu": psutil.cpu_percent(),
-                "ram": psutil.virtual_memory().percent,
-                "threads": threading.active_count()
-            })
-            self.history.append(self.metrics["cpu"])
+            self.stats["cpu"] = psutil.cpu_percent()
+            self.stats["ram"] = psutil.virtual_memory().percent
+            self.history.append(self.stats["cpu"])
             
+            # Prepazione Payload
             data = {
-                't': 'HB', 
-                'id': self.id, 
-                's': self.metrics, 
+                'type': 'DATA',
+                'id': self.id,
+                'host': self.hostname,
+                's': self.stats,
                 'h': list(self.history),
-                'net_type': self.connection_type
+                'ip': socket.gethostbyname(self.hostname)
             }
             msg = json.dumps(data).encode()
-            sig = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
-            try: self.sock.send_multipart([b"", msg, sig.encode()])
-            except: pass
-            time.sleep(2)
+            sig = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest().encode()
+            
+            try:
+                self.sock.send_multipart([b"", msg, sig])
+            except:
+                self.connected = False
+            
+            time.sleep(1.5)
 
-# --- DASHBOARD ---
-def draw_main():
-    apply_custom_styles()
+# --- UI LOGIC ---
+def main():
+    apply_v17_styles()
+    
+    if len(sys.argv) < 2:
+        st.error("Usa: 'master' o 'worker' come argomento.")
+        return
+
     mode = sys.argv[1].lower()
 
     if mode == "master":
-        if 'engine' not in st.session_state:
-            st.session_state.engine = ObsidianMaster()
-            st.session_state.engine.start()
+        if 'master' not in st.session_state:
+            st.session_state.master = PrometheusMaster()
+            st.session_state.master.start()
         
-        master = st.session_state.engine
+        m = st.session_state.master
         
-        # Header
-        col_t, col_s = st.columns([3, 1])
-        with col_t:
-            st.markdown("<h1 style='font-size: 3rem; margin:0;'>HYDRA <span style='color:#00ff88'>NEXUS V16</span></h1>", unsafe_allow_html=True)
-            st.markdown(f"**NEURAL CORE ACTIVE** // Monitoring `{len(get_all_interfaces())}` interfaces")
-        with col_s:
-             st.markdown(f"<div class='metric-card'><small>SESSION TIME</small><br><b style='color:#00ff88'>{datetime.now().strftime('%H:%M:%S')}</b></div>", unsafe_allow_html=True)
+        st.markdown("<h1>HYDRA <span style='color:#00ff88'>MASTER</span></h1>", unsafe_allow_html=True)
+        st.write(f"📡 Server Nome: `{m.hostname}` | Porta: `{TCP_PORT}`")
+        
+        # Dashboard
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("NODI AGGANCIATI", len(m.nodes))
+        col_m2.metric("EVENTI TOTALI", len(m.events))
+        col_m3.metric("STATUS", "READY")
 
         st.write("---")
-
-        # Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("ACTIVE NODES", len(master.nodes))
-        m2.metric("JOBS PROCESSED", master.metrics["tasks_ok"])
-        avg_cpu = np.mean([n['stats']['cpu'] for n in master.nodes.values()]) if master.nodes else 0
-        m3.metric("MESH LOAD", f"{avg_cpu:.1f}%")
-        m4.metric("BROADCAST", "ACTIVE", delta="STABLE")
-
-        # Nodes Grid
-        st.markdown("### 🛰️ MESH TOPOLOGY")
-        if not master.nodes: st.info("Waiting for neural handshake on LAN/USB/BT...")
+        
+        # Mappa Nodi
+        st.subheader("🛰️ ACTIVE MESH NODES")
+        if not m.nodes:
+            st.info("In attesa di Worker... Assicurati che i Client facciano lo scan.")
         else:
-            node_items = list(master.nodes.items())
-            for i in range(0, len(node_items), 3):
+            n_list = list(m.nodes.items())
+            for i in range(0, len(n_list), 3):
                 cols = st.columns(3)
                 for j in range(3):
-                    if i + j < len(node_items):
-                        nid, data = node_items[i+j]
+                    if i+j < len(n_list):
+                        nid, d = n_list[i+j]
                         with cols[j]:
                             st.markdown(f"""
-                            <div class='node-container'>
-                                <span class='status-online'>● LINKED via {data['type']}</span>
-                                <h4 style='margin:10px 0;'>{nid}</h4>
-                                <code style='font-size:12px;'>CPU: {data['stats']['cpu']}% | RAM: {data['stats']['ram']}% | THREADS: {data['stats']['threads']}</code>
+                            <div class='master-card'>
+                                <div class='status-led'></div> <b>{d['hostname']}</b><br>
+                                <small>ID: {nid} | IP: {d['ip']}</small><br>
+                                <hr style='margin:10px 0; border:0; border-top:1px solid #333;'>
+                                <span style='color:#00ff88'>CPU: {d['stats']['cpu']}%</span> | RAM: {d['stats']['ram']}%
                             </div>
                             """, unsafe_allow_html=True)
-                            fig = go.Figure(go.Scatter(y=data['history'], fill='tozeroy', line=dict(color='#00ff88', width=2)))
+                            fig = go.Figure(go.Scatter(y=d['history'], fill='tozeroy', line=dict(color='#00ff88', width=2)))
                             fig.update_layout(height=80, margin=dict(l=0,r=0,t=0,b=0), xaxis_visible=False, yaxis_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-                            st.plotly_chart(fig, use_container_width=True, key=f"g_{nid}")
+                            st.plotly_chart(fig, use_container_width=True, key=nid)
 
-        st.markdown("### 📜 GLOBAL EVENT LOG")
-        st.dataframe(pd.DataFrame(list(master.event_stream)), use_container_width=True)
+        st.subheader("📜 REAL-TIME HUB LOGS")
+        st.dataframe(pd.DataFrame(list(m.events)), use_container_width=True)
+        time.sleep(1); st.rerun()
 
     elif mode == "worker":
-        if 'node' not in st.session_state:
-            # Auto-Discovery mode
-            manual_ip = sys.argv[2] if len(sys.argv) > 2 else None
-            st.session_state.node = ObsidianWorker(manual_ip)
-            st.session_state.node.start()
+        st.markdown("<h1>HYDRA <span style='color:#00ff88'>WORKER</span></h1>", unsafe_allow_html=True)
         
-        worker = st.session_state.node
-        st.markdown(f"<h1 style='margin:0;'>NODE <span style='color:#00ff88'>INFILTRATOR</span></h1>", unsafe_allow_html=True)
-        st.markdown(f"**ID:** `{worker.id}` // **STATUS:** `{worker.connection_type}`")
+        if 'worker' not in st.session_state:
+            st.subheader("🔍 Ricerca Master in corso...")
+            
+            # Logica di Scan
+            if 'found_masters' not in st.session_state:
+                st.session_state.found_masters = {}
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("LOCAL LOAD", f"{worker.metrics['cpu']}%")
-        m2.metric("RAM UTIL", f"{worker.metrics['ram']}%")
-        m3.metric("TASKS DONE", worker.metrics["tasks_done"])
-        m4.metric("ACTIVE THREADS", worker.metrics["threads"])
-
-        st.markdown("### 📈 ANALYTICS")
-        fig = go.Figure(go.Scatter(y=list(worker.history), fill='tozeroy', line=dict(color='#00ff88', width=3)))
-        fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(gridcolor='#111'), xaxis=dict(gridcolor='#111'))
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("### 📜 LOCAL JOBS")
-        st.dataframe(pd.DataFrame(list(worker.local_events)), use_container_width=True)
-
-    time.sleep(1.5)
-    st.rerun()
+            if st.button("📡 AVVIA SCAN RETE"):
+                with st.spinner("Scansione interfacce (WiFi, USB, LAN)..."):
+                    udp_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp_in.bind(('', UDP_PORT))
+                    udp_in.settimeout(4.0)
+                    start_scan = time.time()
+                    while time.time() - start_scan < 4:
+                        try:
+                            data, addr = udp_in.recvfrom(1024)
+                            raw = data.decode().split("|")
+                            if raw[0] == "HYDRA_V17":
+                                # salviamo hostname e IP
+                                st.session_state.found_masters[raw[2]] = raw[1]
+                        except: pass
+                    udp_in.close()
+            
+            if st.session_state.found_masters:
+                st.write("### Master Rilevati:")
+                for ip, name in st.session_state.found_masters.items():
+                    col_a, col_b = st.columns([3, 1])
+                    col_a.markdown(f"<div class='target-box'>🖥️ <b>{name}</b><br><small>Indirizzo: {ip}</small></div>", unsafe_allow_html=True)
+                    if col_b.button("CONNETTI", key=ip):
+                        st.session_state.worker = PrometheusWorker(ip)
+                        st.session_state.worker.start()
+                        st.rerun()
+            else:
+                st.warning("Nessun Master trovato. Controlla che il Master sia attivo e sulla stessa rete/cavo USB.")
+                manual_ip = st.text_input("Inserisci IP Master manualmente:")
+                if st.button("FORZA CONNESSIONE"):
+                    st.session_state.worker = PrometheusWorker(manual_ip)
+                    st.session_state.worker.start()
+                    st.rerun()
+        else:
+            w = st.session_state.worker
+            st.markdown(f"**CONNESSO A:** `{w.master_ip}` | **MIO ID:** `{w.id}`")
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("CPU NODE", f"{w.stats['cpu']}%")
+            c2.metric("RAM NODE", f"{w.stats['ram']}%")
+            c3.metric("LINK", "ACTIVE" if w.connected else "LOST")
+            
+            fig = go.Figure(go.Scatter(y=list(w.history), fill='tozeroy', line=dict(color='#00ff88', width=3)))
+            fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(gridcolor='#111'), xaxis=dict(gridcolor='#111'))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            if st.button("❌ DISCONNETTI"):
+                del st.session_state.worker
+                st.rerun()
+                
+        time.sleep(1); st.rerun()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage Master: streamlit run file.py master")
-        print("Usage Worker: streamlit run file.py worker [optional_manual_ip]")
-    else:
-        draw_main()
+    main()
