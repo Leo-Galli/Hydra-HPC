@@ -13,15 +13,37 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 import zmq
+import subprocess
 from datetime import datetime
 from collections import deque
 
-# --- CONFIGURAZIONE ---
+# --- CONFIGURAZIONE INTEGRATA ---
 SECRET_KEY = b"HYDRA_OBSIDIAN_V5_2026"
-PORT = 5555
+TCP_PORT = 5555
+UDP_PORT = 5556
 MAX_LOGS = 50
+SSID_NAME = "HYDRA_NEXUS"
+SSID_PASS = "obsidian2026"
 
-# --- STILI CSS (UNIFICATI) ---
+# --- LOGICA ACCESS POINT (WINDOWS) ---
+def manage_hotspot(action="start"):
+    """Crea una rete WiFi dedicata se il PC lo supporta."""
+    try:
+        if action == "start":
+            subprocess.run(f'netsh wlan set hostednetwork mode=allow ssid={SSID_NAME} key={SSID_PASS}', shell=True, capture_output=True)
+            subprocess.run('netsh wlan start hostednetwork', shell=True, capture_output=True)
+    except: pass
+
+# --- UTILS DI RETE ---
+def get_local_ips():
+    ips = []
+    for interface, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                ips.append(addr.address)
+    return ips if ips else ["127.0.0.1"]
+
+# --- STILI CSS (ESTESI DALL'ORIGINALE) ---
 def apply_custom_styles():
     st.markdown("""
         <style>
@@ -50,6 +72,8 @@ def apply_custom_styles():
         .status-online { color: #00ff88; font-weight: bold; font-size: 12px; }
         code { font-family: 'Fira Code', monospace !important; color: #00ff88 !important; }
         .stDataFrame { background: rgba(255, 255, 255, 0.01); border-radius: 10px; }
+        .stButton>button { background: #111; border: 1px solid #333; color: #eee; border-radius: 10px; width: 100%; }
+        .stButton>button:hover { border-color: #00ff88; color: #00ff88; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -58,15 +82,29 @@ class ObsidianMaster:
     def __init__(self):
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.ROUTER)
-        self.socket.bind(f"tcp://*:{PORT}")
+        # Binding su 0.0.0.0 per accettare LAN, USB e WiFi simultaneamente
+        self.socket.bind(f"tcp://0.0.0.0:{TCP_PORT}")
         self.nodes = {} 
         self.event_stream = deque(maxlen=MAX_LOGS)
         self.metrics = {"tasks_ok": 0}
         self.lock = threading.Lock()
 
     def start(self):
+        manage_hotspot("start")
+        threading.Thread(target=self._beacon_sender, daemon=True).start()
         threading.Thread(target=self._network_engine, daemon=True).start()
         threading.Thread(target=self._cleanup, daemon=True).start()
+
+    def _beacon_sender(self):
+        """Invia l'IP del master in broadcast per l'auto-rilevamento."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            for ip in get_local_ips():
+                msg = f"HYDRA_BEACON|{ip}".encode()
+                try: sock.sendto(msg, ('<broadcast>', UDP_PORT))
+                except: pass
+            time.sleep(2)
 
     def _network_engine(self):
         while True:
@@ -76,23 +114,20 @@ class ObsidianMaster:
                     addr, payload, sig = parts[0], parts[2], parts[3].decode()
                     if hmac.new(SECRET_KEY, payload, hashlib.sha256).hexdigest() == sig:
                         data = json.loads(payload.decode())
-                        self._process(addr, data)
+                        nid = data['id']
+                        with self.lock:
+                            if data['t'] == 'HEARTBEAT':
+                                self.nodes[nid] = {'addr': addr, 'stats': data['s'], 'history': data['h'], 'last': time.time()}
+                            elif data['t'] == 'ACK':
+                                self.metrics["tasks_ok"] += 1
+                                self.event_stream.appendleft({'time': datetime.now().strftime("%H:%M:%S"), 'node': nid, 'job': data['jid'], 'status': 'DONE', 'lat': f"{data['el']:.2f}s"})
                 except: pass
-
-    def _process(self, addr, data):
-        nid = data['id']
-        with self.lock:
-            if data['t'] == 'HEARTBEAT':
-                self.nodes[nid] = {'addr': addr, 'stats': data['s'], 'history': data['h'], 'last': time.time()}
-            elif data['t'] == 'ACK':
-                self.metrics["tasks_ok"] += 1
-                self.event_stream.appendleft({'time': datetime.now().strftime("%H:%M:%S"), 'node': nid, 'job': data['jid'], 'status': 'DONE', 'lat': f"{data['el']:.2f}s"})
 
     def _cleanup(self):
         while True:
             now = time.time()
             with self.lock:
-                dead = [n for n, d in self.nodes.items() if now - d['last'] > 10]
+                dead = [n for n, d in self.nodes.items() if now - d['last'] > 12]
                 for n in dead: del self.nodes[n]
             time.sleep(5)
 
@@ -107,35 +142,36 @@ class ObsidianWorker:
         self.history = deque([0]*25, maxlen=25)
         self.local_events = deque(maxlen=MAX_LOGS)
         self.metrics = {"tasks_done": 0, "cpu": 0, "ram": 0}
+        self.active = False
 
     def start(self):
-        self.sock.connect(f"tcp://{self.master_ip}:{PORT}")
+        self.sock.connect(f"tcp://{self.master_ip}:{TCP_PORT}")
+        self.active = True
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._task_loop, daemon=True).start()
 
     def _task_loop(self):
-        while True:
-            parts = self.sock.recv_multipart()
-            payload, sig = parts[1], parts[2].decode()
-            if hmac.new(SECRET_KEY, payload, hashlib.sha256).hexdigest() == sig:
-                req = json.loads(payload.decode())
-                t0 = time.time()
-                # Simulazione lavoro
-                for _ in range(200000): hashlib.sha256(b"work").hexdigest()
-                el = time.time() - t0
-                
-                self.metrics["tasks_done"] += 1
-                self.local_events.appendleft({'time': datetime.now().strftime("%H:%M:%S"), 'job': req['jid'], 'status': 'COMPLETED', 'lat': f"{el:.3f}s"})
-                
-                ans = {'t': 'ACK', 'id': self.id, 'jid': req['jid'], 'el': el}
-                msg = json.dumps(ans).encode()
-                sig_ans = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
-                self.sock.send_multipart([b"", msg, sig_ans.encode()])
+        while self.active:
+            if self.sock.poll(1000):
+                try:
+                    parts = self.sock.recv_multipart()
+                    payload, sig = parts[1], parts[2].decode()
+                    if hmac.new(SECRET_KEY, payload, hashlib.sha256).hexdigest() == sig:
+                        req = json.loads(payload.decode())
+                        t0 = time.time()
+                        for _ in range(250000): hashlib.sha256(b"work").hexdigest()
+                        el = time.time() - t0
+                        self.metrics["tasks_done"] += 1
+                        self.local_events.appendleft({'time': datetime.now().strftime("%H:%M:%S"), 'job': req['jid'], 'status': 'COMPLETED', 'lat': f"{el:.3f}s"})
+                        ans = {'t': 'ACK', 'id': self.id, 'jid': req['jid'], 'el': el}
+                        msg = json.dumps(ans).encode()
+                        sig_ans = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
+                        self.sock.send_multipart([b"", msg, sig_ans.encode()])
+                except: pass
 
     def _heartbeat_loop(self):
-        while True:
-            self.metrics["cpu"] = psutil.cpu_percent()
-            self.metrics["ram"] = psutil.virtual_memory().percent
+        while self.active:
+            self.metrics["cpu"], self.metrics["ram"] = psutil.cpu_percent(), psutil.virtual_memory().percent
             self.history.append(self.metrics["cpu"])
             data = {'t': 'HEARTBEAT', 'id': self.id, 's': {'cpu': self.metrics["cpu"], 'ram': self.metrics["ram"]}, 'h': list(self.history)}
             msg = json.dumps(data).encode()
@@ -144,7 +180,7 @@ class ObsidianWorker:
             except: pass
             time.sleep(2)
 
-# --- DASHBOARD UI (LOGICA CONDIVISA) ---
+# --- UI DRAWING ---
 def draw_header(title, subtitle):
     c1, c2 = st.columns([4, 1])
     with c1:
@@ -154,8 +190,12 @@ def draw_header(title, subtitle):
         st.markdown(f"<div class='metric-card'><small>SYSTEM CLOCK</small><br><b style='color:#00ff88'>{datetime.now().strftime('%H:%M:%S')}</b></div>", unsafe_allow_html=True)
     st.write("---")
 
-def draw_main():
+def main():
     apply_custom_styles()
+    if len(sys.argv) < 2:
+        st.error("Specificare modalità: master o worker")
+        return
+    
     mode = sys.argv[1].lower()
 
     if mode == "master":
@@ -172,11 +212,10 @@ def draw_main():
         m2.metric("JOBS COMPLETED", master.metrics["tasks_ok"])
         avg_load = np.mean([n['stats']['cpu'] for n in master.nodes.values()]) if master.nodes else 0
         m3.metric("CLUSTER LOAD", f"{avg_load:.1f}%")
-        m4.metric("ENGINE", "STABLE", delta="SECURE")
+        m4.metric("IP ADDR", get_local_ips()[0])
 
-        # Node Grid
-        st.markdown("###  NETWORK NODES")
-        if not master.nodes: st.info("Searching for active mesh nodes...")
+        st.markdown("### 🛰️ NETWORK NODES")
+        if not master.nodes: st.info("Waiting for nodes on SSID: HYDRA_NEXUS...")
         else:
             node_items = list(master.nodes.items())
             for i in range(0, len(node_items), 3):
@@ -185,46 +224,56 @@ def draw_main():
                     if i + j < len(node_items):
                         nid, data = node_items[i+j]
                         with cols[j]:
-                            st.markdown(f"<div class='node-container'><span class='status-online'>● ACTIVE</span><h4 style='margin:5px 0;'>{nid}</h4><p style='font-size:13px; color:#888;'>CPU: {data['stats']['cpu']}% | RAM: {data['stats']['ram']}%</p></div>", unsafe_allow_html=True)
+                            st.markdown(f"<div class='node-container'><span class='status-online'>● ONLINE</span><h4 style='margin:5px 0;'>{nid}</h4><p style='font-size:13px; color:#888;'>CPU: {data['stats']['cpu']}% | RAM: {data['stats']['ram']}%</p></div>", unsafe_allow_html=True)
                             fig = go.Figure(go.Scatter(y=data['history'], fill='tozeroy', line=dict(color='#00ff88', width=2)))
                             fig.update_layout(height=80, margin=dict(l=0,r=0,t=0,b=0), xaxis_visible=False, yaxis_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
                             st.plotly_chart(fig, use_container_width=True, key=f"g_{nid}")
 
-        st.markdown("###  GLOBAL EVENT STREAM")
+        st.markdown("### 📜 GLOBAL EVENT STREAM")
         st.dataframe(pd.DataFrame(list(master.event_stream)), use_container_width=True)
+        time.sleep(2); st.rerun()
 
     elif mode == "worker":
-        target = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
-        if 'node' not in st.session_state:
-            st.session_state.node = ObsidianWorker(target)
-            st.session_state.node.start()
+        draw_header("NODE", "Worker Interface")
         
-        worker = st.session_state.node
-        draw_header("NODE", f"Worker Interface // ID: {worker.id}")
+        if 'node' not in st.session_state:
+            st.markdown("<div class='node-container'>", unsafe_allow_html=True)
+            st.subheader("📡 Connection Hub")
+            
+            if st.button("AUTO-SCAN FOR MASTER"):
+                with st.spinner("Listening for Beacon..."):
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.bind(('', UDP_PORT)); sock.settimeout(5.0)
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                        if data.startswith(b"HYDRA_BEACON"):
+                            st.session_state.target_ip = data.decode().split("|")[1]
+                            st.success(f"Master Found: {st.session_state.target_ip}")
+                    except: st.error("No Master found. Check WiFi/USB cable.")
+                    finally: sock.close()
 
-        # Top Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("LOCAL STATUS", "ONLINE")
-        m2.metric("TASKS DONE", worker.metrics["tasks_done"])
-        m3.metric("CPU USAGE", f"{worker.metrics['cpu']}%")
-        m4.metric("RAM USAGE", f"{worker.metrics['ram']}%")
+            manual_ip = st.text_input("Master IP:", st.session_state.get('target_ip', '127.0.0.1'))
+            if st.button("🚀 CONNECT TO MESH"):
+                st.session_state.node = ObsidianWorker(manual_ip)
+                st.session_state.node.start()
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            worker = st.session_state.node
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("STATUS", "LINKED")
+            m2.metric("TASKS DONE", worker.metrics["tasks_done"])
+            m3.metric("CPU", f"{worker.metrics['cpu']}%")
+            m4.metric("RAM", f"{worker.metrics['ram']}%")
 
-        # Performance Graph
-        st.markdown("###  LOCAL PERFORMANCE")
-        fig = go.Figure(go.Scatter(y=list(worker.history), fill='tozeroy', line=dict(color='#00ff88', width=3)))
-        fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(gridcolor='#222'), xaxis=dict(gridcolor='#222'))
-        st.plotly_chart(fig, use_container_width=True)
+            st.markdown("### 📈 PERFORMANCE")
+            fig = go.Figure(go.Scatter(y=list(worker.history), fill='tozeroy', line=dict(color='#00ff88', width=3)))
+            fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("###  MY TASK HISTORY")
-        if not worker.local_events: st.write("Waiting for tasks...")
-        else: st.dataframe(pd.DataFrame(list(worker.local_events)), use_container_width=True)
-
-    time.sleep(2)
-    st.rerun()
+            st.markdown("### 📜 MY TASK HISTORY")
+            st.dataframe(pd.DataFrame(list(worker.local_events)), use_container_width=True)
+            time.sleep(2); st.rerun()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage Master: streamlit run file.py master")
-        print("Usage Worker: streamlit run file.py worker [ip]")
-    else:
-        draw_main()
+    main()
